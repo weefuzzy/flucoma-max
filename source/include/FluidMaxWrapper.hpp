@@ -768,13 +768,14 @@ public:
   using ParamDescType = typename Client::ParamDescType;
   using ParamSetType = typename Client::ParamSetType;
 
-  FluidMaxWrapper(t_symbol*, long ac, t_atom* av)
+  FluidMaxWrapper(t_symbol*, long ac, t_atom* av, bool hasBox = true)
       : mMessages{}, mParams(Client::getParameterDescriptors()),
         mParamSnapshot(Client::getParameterDescriptors()),
         mClient{initParamsFromArgs(ac, av)}
   {
     if (mClient.audioChannelsIn())
     {
+      assert(hasBox && "Audio objects can't be NOBOX");
       assert(mClient.audioChannelsIn() <= (std::numeric_limits<long>::max)());
       dsp_setup(impl::MaxBase::getMSPObject(),
                 static_cast<long>(mClient.audioChannelsIn()));
@@ -792,22 +793,24 @@ public:
 
     for (auto& r : results) printResult(this, r);
 
-    object_obex_store(this, gensym("dumpout"),
-                      (t_object*) outlet_new(this, nullptr));
-
-    if (isNonRealTime<Client>::value ||
-        (IsModel_t<Client>::value && Client::isRealTime::value))
+    if (hasBox)
     {
-      mProgressOutlet = floatout(this);
+      object_obex_store(this, gensym("dumpout"),
+                        (t_object*) outlet_new(this, nullptr));
+
+      if (isNonRealTime<Client>::value ||
+          (IsModel_t<Client>::value && Client::isRealTime::value))
+      {
+        mProgressOutlet = floatout(this);
+      }
+
+      if (isNonRealTime<Client>::value) { mNRTDoneOutlet = bangout(this); }
+
+      if (mClient.controlChannelsOut()) mControlOutlet = listout(this);
+
+      for (index i = 0; i < mClient.audioChannelsOut(); ++i)
+        outlet_new(this, "signal");
     }
-
-    if (isNonRealTime<Client>::value) { mNRTDoneOutlet = bangout(this); }
-
-    if (mClient.controlChannelsOut()) mControlOutlet = listout(this);
-
-    for (index i = 0; i < mClient.audioChannelsOut(); ++i)
-      outlet_new(this, "signal");
-
     Client::getParameterDescriptors().template iterate<AddListener>(this,
                                                                     mParams);
   }
@@ -865,12 +868,29 @@ public:
     return x;
   }
 
+  static void* createNoBox(t_symbol* sym, long ac, t_atom* av)
+  {
+    void* x = object_alloc(getJSClass());
+    new (x) FluidMaxWrapper(sym, ac, av, false);
+
+    if (static_cast<size_t>(attr_args_offset(static_cast<short>(ac), av)) >
+        ParamDescType::NumFixedParams)
+    {
+      object_warn((t_object*) x,
+                  "Too many arguments. Got %d, expect at most %d", ac,
+                  ParamDescType::NumFixedParams);
+    }
+
+    return x;
+  }
+
   static void destroy(FluidMaxWrapper* x) { x->~FluidMaxWrapper(); }
 
   static void makeClass(const char* className)
   {
     const ParamDescType& p = Client::getParameterDescriptors();
     const auto&          m = Client::getMessageDescriptors();
+
     getClass(class_new(className, (method) create, (method) destroy,
                        sizeof(FluidMaxWrapper), 0, A_GIMME, 0));
     WrapperBase::setup(getClass());
@@ -880,9 +900,7 @@ public:
                     0);
     class_addmethod(getClass(), (method) doReset, "reset", 0);
 
-    makeReferable();
-
-    m.template iterate<SetupMessage>();
+    makeReferable(getClass());
 
     class_addmethod(getClass(), (method) doVersion, "version", 0);
     // Change for MSVC, which didn't like the macro version
@@ -898,6 +916,32 @@ public:
     p.template iterateMutable<SetupAttribute>();
     p.template iterateFixed<SetupReadOnlyAttribute>();
     class_dumpout_wrap(getClass());
+
+    // experimentally, make NOBOX wrapers for the model object classes to see
+    // how they get on in js
+    if (FluidMaxWrapper::template IsModel_t<Client>::value ||
+        IsThreadedShared<Client>::value)
+    {
+      std::string jswrapperClassName{className};
+      jswrapperClassName += "jswrap";
+
+      getJSClass(class_new(jswrapperClassName.c_str(), (method) create,
+                           (method) destroy, sizeof(FluidMaxWrapper), 0,
+                           A_GIMME, 0));
+
+      getJSClass()->c_flags = CLASS_FLAG_POLYGLOT;
+      class_addmethod(getJSClass(), (method) doNotify, "notify", A_CANT, 0);
+      class_addmethod(getJSClass(), (method) object_obex_dumpout, "dumpout",
+                      A_CANT, 0);
+      class_addmethod(getJSClass(), (method) doReset, "reset", 0);
+      makeReferable(getJSClass());
+
+      p.template iterateMutable<SetupAttributeNoBox>();
+      p.template iterateFixed<SetupReadOnlyAttributeNoBox>();
+      class_register(CLASS_NOBOX, getJSClass());
+    }
+
+    m.template iterate<SetupMessage>();
     class_register(CLASS_BOX, getClass());
   }
 
@@ -915,14 +959,15 @@ public:
   }
 
   template <typename CType = Client>
-  static std::enable_if_t<!IsThreadedShared<CType>::value> makeReferable()
+  static std::enable_if_t<!IsThreadedShared<CType>::value>
+  makeReferable(t_class*)
   {}
 
   template <typename CType = Client>
-  static std::enable_if_t<IsThreadedShared<CType>::value> makeReferable()
+  static std::enable_if_t<IsThreadedShared<CType>::value>
+  makeReferable(t_class* c)
   {
-    class_addmethod(getClass(), (method) doSharedClientRefer, "refer", A_SYM,
-                    0);
+    class_addmethod(c, (method) doSharedClientRefer, "refer", A_SYM, 0);
   }
 
   static void doSharedClientRefer(FluidMaxWrapper* x, t_symbol* newName)
@@ -953,6 +998,12 @@ public:
 
 private:
   static t_class* getClass(t_class* setClass = nullptr)
+  {
+    static t_class* c = nullptr;
+    return (c = setClass ? setClass : c);
+  }
+
+  static t_class* getJSClass(t_class* setClass = nullptr)
   {
     static t_class* c = nullptr;
     return (c = setClass ? setClass : c);
@@ -1025,12 +1076,34 @@ private:
         typename Client::MessageSetType::template MessageDescriptorAt<
             N>::IndexList;
     x->client().setParams(x->params());
-    invokeMessageImpl<N>(x, s, ac, av, IndexList());
+    invokeMessageBoxImpl<N>(x, s, ac, av, IndexList());
+  }
+
+  template <size_t N>
+  static void invokeMessageNoBox(FluidMaxWrapper* x, t_symbol* s, long ac,
+                                 t_atom* av, t_atom* rv)
+  {
+    using IndexList =
+        typename Client::MessageSetType::template MessageDescriptorAt<
+            N>::IndexList;
+    x->client().setParams(x->params());
+    invokeMessageNoBoxImpl<N>(x, s, ac, av, rv, IndexList());
+  }
+
+  template <size_t N>
+  static void invokeVoidMessageNoBox(FluidMaxWrapper* x, t_symbol* s, long ac,
+                                     t_atom* av)
+  {
+    using IndexList =
+        typename Client::MessageSetType::template MessageDescriptorAt<
+            N>::IndexList;
+    x->client().setParams(x->params());
+    invokeVoidMessageNoBoxImpl<N>(x, s, ac, av, IndexList());
   }
 
   template <size_t N, size_t... Is>
-  static void invokeMessageImpl(FluidMaxWrapper* x, t_symbol* s, long ac,
-                                t_atom* av, std::index_sequence<Is...>)
+  static void invokeMessageBoxImpl(FluidMaxWrapper* x, t_symbol* s, long ac,
+                                   t_atom* av, std::index_sequence<Is...>)
   {
     using ArgTuple =
         typename Client::MessageSetType::template MessageDescriptorAt<
@@ -1043,6 +1116,41 @@ private:
         x->mClient.template invoke<N>(x->mClient, std::get<Is>(args)...);
 
     if (x->checkResult(result)) messageOutput(x, s, result);
+  }
+
+  template <size_t N, size_t... Is>
+  static void invokeMessageNoBoxImpl(FluidMaxWrapper* x, t_symbol* s, long ac,
+                                     t_atom* av, t_atom* rv,
+                                     std::index_sequence<Is...>)
+  {
+    using ArgTuple =
+        typename Client::MessageSetType::template MessageDescriptorAt<
+            N>::ArgumentTypes;
+
+    // Read in arguments
+    ArgTuple args{setArg<ArgTuple, Is>(x, ac, av)...};
+
+    auto result =
+        x->mClient.template invoke<N>(x->mClient, std::get<Is>(args)...);
+
+    if (x->checkResult(result)) noBoxMessageOutput(x, s, result, rv);
+  }
+
+  template <size_t N, size_t... Is>
+  static void invokeVoidMessageNoBoxImpl(FluidMaxWrapper* x, t_symbol*, long ac,
+                                         t_atom* av, std::index_sequence<Is...>)
+  {
+    using ArgTuple =
+        typename Client::MessageSetType::template MessageDescriptorAt<
+            N>::ArgumentTypes;
+
+    // Read in arguments
+    ArgTuple args{setArg<ArgTuple, Is>(x, ac, av)...};
+
+    auto result =
+        x->mClient.template invoke<N>(x->mClient, std::get<Is>(args)...);
+
+    x->checkResult(result);
   }
 
   template <typename Tuple, size_t N>
@@ -1109,10 +1217,54 @@ private:
     object_obex_dumpout(x, s, 0, nullptr);
   }
 
+  template <typename T>
+  static std::enable_if_t<!isSpecialization<T, std::tuple>::value &&
+                          !std::is_void<T>::value>
+  noBoxMessageOutput(FluidMaxWrapper*, t_symbol*, MessageResult<T> r,
+                     t_atom* rv)
+  {
+    size_t              resultSize = ResultSize(static_cast<T>(r));
+    std::vector<t_atom> out(resultSize);
+    ParamAtomConverter::toAtom(out.data(), static_cast<T>(r));
+
+    atom_setobj(rv, object_new(gensym("nobox"), gensym("atomarray"), resultSize,
+                               out.data()));
+  }
+
+  template <typename... Ts>
+  static void noBoxMessageOutput(FluidMaxWrapper*, t_symbol*,
+                                 MessageResult<std::tuple<Ts...>> r, t_atom* rv)
+  {
+    auto   indices = std::index_sequence_for<Ts...>();
+    size_t resultSize;
+    std::array<size_t, sizeof...(Ts)> offsets;
+    std::tie(offsets, resultSize) =
+        ResultSize(static_cast<std::tuple<Ts...>>(r), indices);
+    std::vector<t_atom> out(resultSize);
+    ParamAtomConverter::toAtom(out.data(), static_cast<std::tuple<Ts...>>(r),
+                               indices, offsets);
+    atom_setobj(rv, object_new(gensym("nobox"), gensym("atomarray"), resultSize,
+                               out.data()));
+  }
+
   // Sets up a single message
   template <size_t N, typename T>
   struct SetupMessage
   {
+
+    template <class U>
+    void addNoBoxMessage(const T& m, U&&)
+    {
+      class_addmethod(getJSClass(), (method) invokeMessageNoBox<N>, m.name,
+                      A_GIMMEBACK, 0);
+    }
+
+    void addNoBoxMessage(const T& m, MessageResult<void>)
+    {
+      class_addmethod(getJSClass(), (method) invokeVoidMessageNoBox<N>, m.name,
+                      A_GIMME, 0);
+    }
+
     void operator()(const T& message)
     {
       if (message.name == "load")
@@ -1172,6 +1324,15 @@ private:
       }
       class_addmethod(getClass(), (method) invokeMessage<N>,
                       lowerCase(message.name).c_str(), A_GIMME, 0);
+
+      // do we have a js class
+      auto js = getJSClass();
+      if (js)
+      {
+        using R = typename Client::MessageSetType::template MessageDescriptorAt<
+            N>::ReturnType;
+        addNoBoxMessage(message, R{});
+      }
     }
 
     // This amounts to me really, really promising the compiler that it's all ok
@@ -1246,7 +1407,6 @@ private:
     t_dictionary* d = nullptr;
     t_atom        result[1];
     t_object* jsonreader = (t_object*) object_new(_sym_nobox, _sym_jsonreader);
-    ;
 
     auto messageresult = x->mClient.template invoke<N>(x->mClient);
 
@@ -1281,7 +1441,7 @@ private:
 
     t_dictionary* dest = nullptr;
     t_symbol*     dictName = nullptr;
-    
+
     if (ac)
     {
       dictName = atom_getsym(av);
@@ -1306,7 +1466,7 @@ private:
       dest = x->mDumpDictionary;
       dictName = dictobj_namefromptr(dest);
     }
-    
+
     dictionary_clear(dest);
     dictionary_clone_to_existing(d, dest);
     static t_symbol* modified = gensym("modified");
@@ -1444,6 +1604,37 @@ private:
   };
 
   template <size_t N, typename T>
+  struct SetupAttributeNoBox
+  {
+    void operator()(const T& attr)
+    {
+      std::string name = lowerCase(attr.name);
+      method      setterMethod = (method) &Setter<T, N>::set;
+      method      getterMethod = (method) &Getter<T, N>::get;
+      t_object*   a = attribute_new(name.c_str(), maxAttrType(attr), 0,
+                                  getterMethod, setterMethod);
+
+      class_addattr(getJSClass(), a);
+      CLASS_ATTR_LABEL(getJSClass(), name.c_str(), 0, attr.displayName);
+      decorateAttr(attr, name);
+    }
+
+    template <typename U>
+    void decorateAttr(const U& /*attr*/, std::string /*name*/)
+    {}
+
+    void decorateAttr(const EnumT& attr, std::string name)
+    {
+      std::stringstream enumstrings;
+      for (index i = 0; i < attr.numOptions; ++i)
+        enumstrings << '"' << attr.strings[i] << "\" ";
+      CLASS_ATTR_STYLE(getJSClass(), name.c_str(), 0, "enum");
+      CLASS_ATTR_ENUMINDEX(getJSClass(), name.c_str(), 0,
+                           enumstrings.str().c_str());
+    }
+  };
+
+  template <size_t N, typename T>
   struct SetupReadOnlyAttribute
   {
     void operator()(const T& attr)
@@ -1456,6 +1647,21 @@ private:
       CLASS_ATTR_LABEL(getClass(), name.c_str(), 0, attr.displayName);
     }
   };
+
+  template <size_t N, typename T>
+  struct SetupReadOnlyAttributeNoBox
+  {
+    void operator()(const T& attr)
+    {
+      std::string name = lowerCase(attr.name);
+      method      getterMethod = (method) &Getter<T, N>::get;
+      t_object*   a = attribute_new(name.c_str(), maxAttrType(attr), 0,
+                                  getterMethod, nullptr);
+      class_addattr(getJSClass(), a);
+      CLASS_ATTR_LABEL(getJSClass(), name.c_str(), 0, attr.displayName);
+    }
+  };
+
   // Get Symbols for attribute types
 
   static t_symbol* maxAttrType(FloatT) { return USESYM(float64); }
